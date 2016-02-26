@@ -47,6 +47,7 @@
 #define FOUND_DEVICE	0x1
 #define FOUND_BOOTREPO	0x2
 #define FOUND_APKOVL	0x4
+#define FOUND_ROOTSQFS	0x8
 
 #define TRIGGER_THREAD		0x1
 #define CRYPTSETUP_THREAD	0x2
@@ -203,6 +204,7 @@ struct ueventconf {
 	int fork_count;
 	char *bootrepos;
 	char *apkovls;
+	char *rootsqfs;
 	int timeout;
 	int efd;
 	unsigned running_threads;
@@ -521,16 +523,13 @@ static void bootrepo_cb(const char *path, const void *data)
 	repos->count++;
 }
 
-static int find_apkovl(const char *dir, const char *outfile)
+static int find_filename(const char *pattern, const char *outfile)
 {
-	char pattern[PATH_MAX];
 	glob_t gl;
 	int r, fd;
 
 	if (outfile == NULL)
 		return 0;
-
-	snprintf(pattern, sizeof(pattern), "%s/*.apkovl.tar.gz*", dir);
 
 	r = glob(pattern, 0, NULL, &gl);
 	if (r != 0)
@@ -541,23 +540,47 @@ static int find_apkovl(const char *dir, const char *outfile)
 		err(1, "%s", outfile);
 
 	for (r = 0; r < gl.gl_pathc; r++) {
-		dbg("Found apkovl: %s", gl.gl_pathv[r]);
+		dbg("Found: %s", gl.gl_pathv[r]);
 		write(fd, gl.gl_pathv[r], strlen(gl.gl_pathv[r]));
 		write(fd, "\n", 1);
 	}
 	close(fd);
 	globfree(&gl);
-	return FOUND_APKOVL;
+	return 1;
 }
 
-static int find_bootrepos(const char *devnode, const char *type,
-			 char *bootrepos, const char *apkovls)
+static int find_apkovl(const char *dir, const char *outfile)
+{
+	char pattern[PATH_MAX];
+
+	if (outfile == NULL)
+		return 0;
+
+	snprintf(pattern, sizeof(pattern), "%s/*.apkovl.tar.gz*", dir);
+
+	return find_filename(pattern, outfile) ? FOUND_APKOVL : 0;
+}
+
+static int find_rootsqfs(const char *dir, const char *outfile)
+{
+	char pattern[PATH_MAX];
+
+	if (outfile == NULL)
+		return 0;
+
+	snprintf(pattern, sizeof(pattern), "%s/boot/*.sqfs", dir);
+
+	return find_filename(pattern, outfile) ? FOUND_ROOTSQFS : 0;
+}
+
+static int find_bootrepos(struct ueventconf *conf, const char *devnode,
+			  const char *type)
 {
 	char mountdir[PATH_MAX] = "";
 	char *devname;
 	int r, rc = 0;
 	struct bootrepos repos = {
-		.outfile = bootrepos,
+		.outfile = conf->bootrepos,
 		.count = 0,
 	};
 	struct recurse_opts opts = {
@@ -565,7 +588,6 @@ static int find_bootrepos(const char *devnode, const char *type,
 		.callback = bootrepo_cb,
 		.userdata = &repos,
 	};
-
 
 	/* skip already mounted devices */
 	if (is_mounted(devnode)) {
@@ -591,8 +613,10 @@ static int find_bootrepos(const char *devnode, const char *type,
 	if (repos.count > 0)
 		rc |= FOUND_BOOTREPO;
 
-	if (find_apkovl(mountdir, apkovls))
+	if (find_apkovl(mountdir, conf->apkovls))
 		rc |= FOUND_APKOVL;
+
+	rc |= find_rootsqfs(mountdir, conf->rootsqfs);
 
 	if (rc == 0)
 		umount(mountdir);
@@ -616,14 +640,14 @@ static int is_same_device(const struct uevent *ev, const char *nodepath)
 }
 
 
-static int searchdev(struct uevent *ev, const char *searchdev, char *bootrepos,
-		     const char *apkovls)
+static int searchdev(struct uevent *ev, struct ueventconf *conf,
+		     const char *searchdev)
 {
 	static blkid_cache cache = NULL;
 	char *type = NULL, *label = NULL, *uuid = NULL;
 	int rc = 0;
 
-	if (searchdev == NULL && bootrepos == NULL && apkovls == NULL)
+	if (searchdev == NULL && conf == NULL)
 		return 0;
 
 	if (searchdev && (strcmp(ev->devname, searchdev) == 0
@@ -664,8 +688,8 @@ static int searchdev(struct uevent *ev, const char *searchdev, char *bootrepos,
 			start_mdadm(ev->devnode);
 		} else if (strcmp("LVM2_member", type) == 0) {
 			start_lvm2(ev->devnode);
-		} else if (bootrepos) {
-			rc = find_bootrepos(ev->devnode, type, bootrepos, apkovls);
+		} else if (conf) {
+			rc = find_bootrepos(conf, ev->devnode, type);
 		}
 	}
 
@@ -718,13 +742,12 @@ static int dispatch_uevent(struct uevent *ev, struct ueventconf *conf)
 			snprintf(ev->devnode, sizeof(ev->devnode), "/dev/%s",
 				 ev->devname);
 			pthread_mutex_lock(&conf->cryptsetup_mutex);
-			rc = searchdev(ev, conf->search_device,
-				       conf->bootrepos, conf->apkovls);
+			rc = searchdev(ev, conf, conf->search_device);
 			pthread_mutex_unlock(&conf->cryptsetup_mutex);
 			if (rc)
 				return rc;
 
-			if (searchdev(ev, conf->crypt_device, NULL, NULL)) {
+			if (searchdev(ev, NULL, conf->crypt_device)) {
 				strncpy(conf->crypt_devnode,
 					conf->crypt_device[0] == '/' ? conf->crypt_device : ev->devnode,
 					sizeof(conf->crypt_devnode));
@@ -825,6 +848,7 @@ static void usage(int rc)
 	" -d              enable debugging ouput\n"
 	" -f SUBSYSTEM    filter subsystem\n"
 	" -p PROGRAM      use PROGRAM as handler for every event with DEVNAME\n"
+	" -s OUTFILE      add path(s) to root squashfs to OUTFILE\n"
 	" -t TIMEOUT      timeout after TIMEOUT milliseconds without uevents\n"
 	"\n", argv0);
 
@@ -887,6 +911,9 @@ int main(int argc, char *argv[])
 		break;
 	case 'p':
 		conf.program_argv[0] = EARGF(usage(1));
+		break;
+	case 's':
+		conf.rootsqfs = EARGF(usage(1));
 		break;
 	case 't':
 		conf.timeout = atoi(EARGF(usage(1)));
@@ -975,7 +1002,8 @@ int main(int argc, char *argv[])
 
 			if ((found & FOUND_DEVICE)
 			    || ((found & FOUND_BOOTREPO) &&
-				(found & FOUND_APKOVL))) {
+				(found & FOUND_APKOVL))
+			    || (found & FOUND_ROOTSQFS)) {
 				if (conf.timeout)
 					dbg("FOUND! setting timeout to 0");
 				conf.timeout = 0;
