@@ -389,7 +389,7 @@ fi
 ebegin "Mounting boot media"
 nlplug-findfs $cryptopts -p /sbin/mdev ${KOPT_debug_init:+-d} \
 	${KOPT_usbdelay:+-t $(( $KOPT_usbdelay * 1000 ))} \
-	$repoopts -a /tmp/apkovls
+	$repoopts -a /tmp/apkovls -s /tmp/rootsqfs
 eend $?
 
 # early console?
