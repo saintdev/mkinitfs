@@ -408,7 +408,16 @@ if [ -n "$KOPT_rootflags" ]; then
 	rootflags="$rootflags,$KOPT_rootflags"
 fi
 
-mount -t tmpfs -o $rootflags tmpfs $sysroot
+if [ -e /tmp/rootsqfs ]; then
+	rootsqfs=$(head -n 1 /tmp/rootsqfs)
+fi
+
+mount -t tmpfs -o $rootflags tmpfs /.root-rw
+mkdir /.root-rw/work /.root-rw/root
+cp $rootsqfs $(dirname $rootsqfs)/modloop-grsec /.root-rw/
+mount -t squashfs /.root-rw/$(basename $rootsqfs) /.root-ro
+mount -t squashfs /.root-rw/modloop-grsec /.modloop
+mount -t overlay -o lowerdir=/.root-ro:/.modloop,upperdir=/.root-rw/root,workdir=/.root-rw/work overlay $sysroot
 
 case "$KOPT_apkovl" in
 	'')
@@ -455,7 +464,7 @@ if [ -f "$sysroot/etc/.default_boot_services" -o ! -f "$ovl" ]; then
 	rc_add dmesg sysinit
 	rc_add mdev sysinit
 	rc_add hwdrivers sysinit
-	rc_add modloop sysinit
+# 	rc_add modloop sysinit
 
 	rc_add hwclock boot
 	rc_add modules boot
